@@ -68,17 +68,41 @@ class AkShareSource:
             df = self.ak.stock_zh_a_minute(symbol=symbol, period="1", adjust="qfq")
         except Exception as exc:  # pragma: no cover - upstream variations
             raise RuntimeError(f"Failed to fetch intraday for {symbol}: {exc}") from exc
-        df = df.rename(columns={"datetime": "datetime", "close": "close", "volume": "volume", "amount": "amount"})
+        rename_map = {
+            "时间": "datetime",
+            "datetime": "datetime",
+            "收盘": "close",
+            "close": "close",
+            "成交量": "volume",
+            "volume": "volume",
+            "成交额": "amount",
+            "amount": "amount",
+        }
+        df = df.rename(columns=rename_map)
+        if "datetime" not in df.columns:
+            raise RuntimeError(f"Intraday data missing datetime column for {symbol}.")
         df["datetime"] = pd.to_datetime(df["datetime"])
         df = df[df["datetime"].dt.date == trade_date]
         return df
 
     def get_index_intraday(self, trade_date: date, index_symbol: str) -> pd.DataFrame:
-        try:
-            df = self.ak.index_zh_a_hist_min_em(symbol=index_symbol)
-        except Exception as exc:  # pragma: no cover - upstream variations
-            raise RuntimeError(f"Failed to fetch index intraday for {index_symbol}: {exc}") from exc
+        symbols_to_try = [index_symbol]
+        if index_symbol.endswith(".SH"):
+            symbols_to_try.append(index_symbol.replace(".SH", ""))
+        last_exc = None
+        df = pd.DataFrame()
+        for symbol in symbols_to_try:
+            try:
+                df = self.ak.index_zh_a_hist_min_em(symbol=symbol)
+                if not df.empty:
+                    break
+            except Exception as exc:  # pragma: no cover - upstream variations
+                last_exc = exc
+        if df.empty and last_exc is not None:
+            raise RuntimeError(f"Failed to fetch index intraday for {index_symbol}: {last_exc}") from last_exc
         df = df.rename(columns={"时间": "datetime", "收盘": "close", "成交量": "volume", "成交额": "amount"})
+        if "datetime" not in df.columns:
+            raise RuntimeError(f"Index intraday data missing datetime column for {index_symbol}.")
         df["datetime"] = pd.to_datetime(df["datetime"])
         df = df[df["datetime"].dt.date == trade_date]
         return df

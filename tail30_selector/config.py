@@ -14,6 +14,8 @@ class StrategyConfig:
     turnover_range: Tuple[float, float] = (0.05, 0.10)
     float_mktcap_range: Tuple[float, float] = (5e9, 1e10)
     ma_periods: List[int] = field(default_factory=lambda: [5, 10, 20, 60])
+    ma_slope_periods: List[int] = field(default_factory=lambda: [5, 10, 20])
+    ma_slope_required_ratio: float = 1.0
     intraday_above_vwap_ratio_day: float = 0.80
     intraday_above_vwap_ratio_tail: float = 0.90
     tail_window_start: str = "14:30"
@@ -33,6 +35,16 @@ class StrategyConfig:
     volume_shape_jump_ratio_high: float = 2.2
     volume_shape_jump_ratio_low: float = 0.45
     volume_shape_jump_max_count: int = 1
+    volume_shape_sign_switch_ratio_max: float = 0.5
+    relaxed_volume_shape_enabled: bool = True
+    relaxed_volume_shape_sigma_max: float = 0.6
+    relaxed_volume_shape_cv_max: float = 1.0
+    relaxed_volume_shape_sep_min: float = 0.8
+    relaxed_volume_shape_gain_min: float = 0.05
+    relaxed_volume_shape_recent_ratio_min: float = 1.1
+    relaxed_volume_shape_jump_max_count: int = 2
+    relaxed_volume_shape_sign_switch_ratio_max: float = 0.8
+    volume_shape_skip_if_empty: bool = True
     max_output: int = 20
     retry_times: int = 2
     intraday_minute_freq: str = "1min"

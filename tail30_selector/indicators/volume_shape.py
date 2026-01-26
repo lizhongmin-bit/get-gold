@@ -38,6 +38,7 @@ def analyze_volume_shape(
     jump_ratio_high: float = 2.2,
     jump_ratio_low: float = 0.45,
     max_jump_count: int = 1,
+    sign_switch_ratio_max: float = 0.5,
 ) -> VolumeShapeResult:
     volumes = volume_series.dropna().astype(float)
     fail_reasons: list[str] = []
@@ -103,7 +104,8 @@ def analyze_volume_shape(
         fail_reasons.append("jump_extreme_too_many")
 
     sign_switch_count = _sign_switch_count(x)
-    if sign_switch_count > int(0.5 * (n - 2)):
+    max_switches = int(sign_switch_ratio_max * (n - 2)) if n > 2 else 0
+    if sign_switch_count > max_switches:
         fail_reasons.append("sign_switch_too_many")
 
     is_stepwise = len(fail_reasons) == 0
@@ -198,6 +200,8 @@ def _segments_from_breakpoints(breakpoints: list[int], n: int) -> list[tuple[int
     start = 0
     segments = []
     for bp in breakpoints:
+        if bp <= start:
+            continue
         segments.append((start, bp))
         start = bp
     if start < n:

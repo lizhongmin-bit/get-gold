@@ -1,6 +1,7 @@
 """Tail30 strategy: implement stepwise filters from 14:30 onward."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -44,6 +45,7 @@ class Tail30Strategy:
     def __init__(self, data_source: DataSource, config: StrategyConfig):
         self.data_source = data_source
         self.config = config
+        self.logger = logging.getLogger(__name__)
 
     def run(self, trade_date: date, universe: list[str]) -> list[StockStepResult]:
         snapshot = self.data_source.get_daily_snapshot(trade_date, universe)
@@ -51,7 +53,174 @@ class Tail30Strategy:
         for _, row in snapshot.iterrows():
             result = self._evaluate_symbol(trade_date, row)
             results.append(result)
+        self._log_step_summary(results)
+        if self.config.relaxed_volume_shape_enabled:
+            strict_step5_pass = any(
+                r.step5_pass
+                for r in results
+                if r.step1_pass and r.step2_pass and r.step3_pass and r.step4_pass
+            )
+            if not strict_step5_pass:
+                self.logger.info(
+                    "Step5 strict passed zero; applying relaxed volume shape thresholds."
+                )
+                for i, (_, row) in enumerate(snapshot.iterrows()):
+                    prior = results[i]
+                    if prior.step1_pass and prior.step2_pass and prior.step3_pass and prior.step4_pass:
+                        results[i] = self._evaluate_symbol(
+                            trade_date, row, relax_volume_shape=True
+                        )
+                self._log_step_summary(results)
+        if self.config.volume_shape_skip_if_empty:
+            relaxed_step5_pass = any(
+                r.step5_pass
+                for r in results
+                if r.step1_pass and r.step2_pass and r.step3_pass and r.step4_pass
+            )
+            if not relaxed_step5_pass:
+                self.logger.info("Step5 relaxed passed zero; skipping volume shape filter.")
+                for i, (_, row) in enumerate(snapshot.iterrows()):
+                    prior = results[i]
+                    if prior.step1_pass and prior.step2_pass and prior.step3_pass and prior.step4_pass:
+                        results[i] = self._evaluate_symbol(
+                            trade_date, row, skip_volume_shape=True
+                        )
+                self._log_step_summary(results)
         return results
+
+    def _log_step_summary(self, results: list[StockStepResult]) -> None:
+        total = len(results)
+        if total == 0:
+            self.logger.warning("No symbols returned from daily snapshot.")
+            return
+        step1 = sum(r.step1_pass for r in results)
+        step2 = sum(r.step2_pass for r in results)
+        step3 = sum(r.step3_pass for r in results)
+        step4 = sum(r.step4_pass for r in results)
+        step5 = sum(r.step5_pass for r in results)
+        step6 = sum(r.step6_pass for r in results)
+        step7 = sum(r.step7_pass for r in results)
+        intraday_empty = sum(1 for r in results if r.notes and r.notes.get("intraday_empty"))
+        intraday_error = sum(1 for r in results if r.notes and r.notes.get("intraday_error"))
+        daily_history_missing = sum(
+            1 for r in results if r.notes and r.notes.get("daily_history_missing")
+        )
+        self.logger.info(
+            "Step pass counts: total=%d s1=%d s2=%d s3=%d s4=%d s5=%d s6=%d s7=%d",
+            total,
+            step1,
+            step2,
+            step3,
+            step4,
+            step5,
+            step6,
+            step7,
+        )
+        if intraday_empty or intraday_error or daily_history_missing:
+            self.logger.info(
+                "Data gaps: daily_history_missing=%d intraday_empty=%d intraday_error=%d",
+                daily_history_missing,
+                intraday_empty,
+                intraday_error,
+            )
+        step4_candidates = [r for r in results if r.step1_pass and r.step2_pass and r.step3_pass and r.step4_pass]
+        if step4_candidates:
+            fail_reason_counts: dict[str, int] = {}
+            history_len_counts: dict[int, int] = {}
+            for r in step4_candidates:
+                if r.notes and r.notes.get("daily_history_len") is not None:
+                    history_len = int(r.notes["daily_history_len"])
+                    history_len_counts[history_len] = history_len_counts.get(history_len, 0) + 1
+                if r.notes and r.notes.get("volume_shape_fail_reasons"):
+                    for reason in r.notes["volume_shape_fail_reasons"]:
+                        fail_reason_counts[reason] = fail_reason_counts.get(reason, 0) + 1
+            if history_len_counts:
+                top_history = sorted(history_len_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+                self.logger.info("Step5 history length top: %s", top_history)
+            if fail_reason_counts:
+                top_reasons = sorted(fail_reason_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+                self.logger.info("Step5 fail reasons top: %s", top_reasons)
+        step5_candidates = [
+            r
+            for r in results
+            if r.step1_pass
+            and r.step2_pass
+            and r.step3_pass
+            and r.step4_pass
+            and r.step5_pass
+        ]
+        if step5_candidates:
+            bullish_ok = sum(1 for r in step5_candidates if r.bullish_alignment)
+            diverge_ok = sum(1 for r in step5_candidates if r.ma_diverging)
+            close_ok = sum(1 for r in step5_candidates if r.close_above_ma)
+            slope_ok = sum(
+                1
+                for r in step5_candidates
+                if r.ma_slope
+                and (sum(1 for val in r.ma_slope.values() if val > 0) / len(r.ma_slope))
+                >= self.config.ma_slope_required_ratio
+            )
+            self.logger.info(
+                "Step6 components: bullish=%d diverging=%d close_above_ma=%d slope_positive=%d (base=%d)",
+                bullish_ok,
+                diverge_ok,
+                close_ok,
+                slope_ok,
+                len(step5_candidates),
+            )
+        step6_candidates = [
+            r
+            for r in results
+            if r.step1_pass
+            and r.step2_pass
+            and r.step3_pass
+            and r.step4_pass
+            and r.step5_pass
+            and r.step6_pass
+        ]
+        if step6_candidates:
+            vwap_day_ok = sum(
+                1
+                for r in step6_candidates
+                if r.intraday and r.intraday.above_vwap_ratio_day >= self.config.intraday_above_vwap_ratio_day
+            )
+            vwap_tail_ok = sum(
+                1
+                for r in step6_candidates
+                if r.intraday and r.intraday.above_vwap_ratio_tail >= self.config.intraday_above_vwap_ratio_tail
+            )
+            outperf_mean_ok = sum(
+                1
+                for r in step6_candidates
+                if r.intraday and r.intraday.outperformance_mean_tail > 0
+            )
+            outperf_last_ok = sum(
+                1
+                for r in step6_candidates
+                if r.intraday and r.intraday.outperformance_last_tail > 0
+            )
+            new_high_ok = sum(
+                1
+                for r in step6_candidates
+                if r.intraday and (not self.config.new_high_after_1430 or r.intraday.new_high_after_1430)
+            )
+            pullback_ok = sum(
+                1
+                for r in step6_candidates
+                if r.intraday and (not self.config.pullback_not_break or r.intraday.pullback_support)
+            )
+            intraday_ready = sum(1 for r in step6_candidates if r.intraday is not None)
+            self.logger.info(
+                "Step7 components: intraday_ready=%d vwap_day=%d vwap_tail=%d outperf_mean=%d outperf_last=%d new_high=%d pullback=%d (base=%d)",
+                intraday_ready,
+                vwap_day_ok,
+                vwap_tail_ok,
+                outperf_mean_ok,
+                outperf_last_ok,
+                new_high_ok,
+                pullback_ok,
+                len(step6_candidates),
+            )
 
     def _retry_call(self, func, *args, **kwargs):
         for attempt in range(self.config.retry_times + 1):
@@ -61,7 +230,13 @@ class Tail30Strategy:
                 if attempt >= self.config.retry_times:
                     raise exc
 
-    def _evaluate_symbol(self, trade_date: date, row: pd.Series) -> StockStepResult:
+    def _evaluate_symbol(
+        self,
+        trade_date: date,
+        row: pd.Series,
+        relax_volume_shape: bool = False,
+        skip_volume_shape: bool = False,
+    ) -> StockStepResult:
         pct_change = float(row.get("pct_change", 0.0))
         volume_ratio = float(row.get("volume_ratio", 0.0) or 0.0)
         turnover = float(row.get("turnover", 0.0) or 0.0)
@@ -122,56 +297,97 @@ class Tail30Strategy:
 
         if step1_pass and step2_pass and step3_pass and step4_pass:
             # Step5: 成交量台阶式放量判定
+            ma_lookback = max(self.config.ma_periods)
+            history_lookback = max(self.config.volume_shape_window, ma_lookback + 1)
             history = self._retry_call(
                 self.data_source.get_daily_history,
                 trade_date,
                 symbol,
-                lookback=self.config.volume_shape_window,
+                lookback=history_lookback,
             )
-            volume_shape = analyze_volume_shape(
-                history["volume"],
-                min_seg=self.config.volume_shape_min_seg,
-                k_candidates=self.config.volume_shape_k_candidates,
-                delta_min=self.config.volume_shape_delta_min,
-                delta_allow=self.config.volume_shape_delta_allow,
-                sigma_max=self.config.volume_shape_sigma_max,
-                cv_max=self.config.volume_shape_cv_max,
-                sep_min=self.config.volume_shape_sep_min,
-                gain_min=self.config.volume_shape_gain_min,
-                recent_ratio_min=self.config.volume_shape_recent_ratio_min,
-                jump_ratio_high=self.config.volume_shape_jump_ratio_high,
-                jump_ratio_low=self.config.volume_shape_jump_ratio_low,
-                max_jump_count=self.config.volume_shape_jump_max_count,
-            )
-            step5_pass = volume_shape.is_stepwise
-            reasons.append(
-                "Step5成交量形态台阶式放量: "
-                f"{step5_pass} (K={volume_shape.k_star}, gain={volume_shape.gain:.2f}, "
-                f"ratio={volume_shape.recent_vs_early_ratio:.2f})"
-            )
+            if history.empty or "volume" not in history or "close" not in history:
+                notes["daily_history_missing"] = True
+                reasons.append("Step5/6日线数据缺失: False")
+            else:
+                notes["daily_history_len"] = int(len(history))
+                if len(history) < ma_lookback:
+                    notes["ma_history_insufficient"] = True
+                if skip_volume_shape:
+                    step5_pass = True
+                    notes["volume_shape_skipped"] = True
+                    reasons.append("Step5成交量形态台阶式放量: True (已跳过)")
+                elif relax_volume_shape:
+                    notes["volume_shape_relaxed"] = True
+                    volume_shape = analyze_volume_shape(
+                        history["volume"].tail(self.config.volume_shape_window),
+                        min_seg=self.config.volume_shape_min_seg,
+                        k_candidates=self.config.volume_shape_k_candidates,
+                        delta_min=self.config.volume_shape_delta_min,
+                        delta_allow=self.config.volume_shape_delta_allow,
+                        sigma_max=self.config.relaxed_volume_shape_sigma_max,
+                        cv_max=self.config.relaxed_volume_shape_cv_max,
+                        sep_min=self.config.relaxed_volume_shape_sep_min,
+                        gain_min=self.config.relaxed_volume_shape_gain_min,
+                        recent_ratio_min=self.config.relaxed_volume_shape_recent_ratio_min,
+                        jump_ratio_high=self.config.volume_shape_jump_ratio_high,
+                        jump_ratio_low=self.config.volume_shape_jump_ratio_low,
+                        max_jump_count=self.config.relaxed_volume_shape_jump_max_count,
+                        sign_switch_ratio_max=self.config.relaxed_volume_shape_sign_switch_ratio_max,
+                    )
+                else:
+                    volume_shape = analyze_volume_shape(
+                        history["volume"].tail(self.config.volume_shape_window),
+                        min_seg=self.config.volume_shape_min_seg,
+                        k_candidates=self.config.volume_shape_k_candidates,
+                        delta_min=self.config.volume_shape_delta_min,
+                        delta_allow=self.config.volume_shape_delta_allow,
+                        sigma_max=self.config.volume_shape_sigma_max,
+                        cv_max=self.config.volume_shape_cv_max,
+                        sep_min=self.config.volume_shape_sep_min,
+                        gain_min=self.config.volume_shape_gain_min,
+                        recent_ratio_min=self.config.volume_shape_recent_ratio_min,
+                        jump_ratio_high=self.config.volume_shape_jump_ratio_high,
+                        jump_ratio_low=self.config.volume_shape_jump_ratio_low,
+                        max_jump_count=self.config.volume_shape_jump_max_count,
+                        sign_switch_ratio_max=self.config.volume_shape_sign_switch_ratio_max,
+                    )
+                if not skip_volume_shape:
+                    step5_pass = volume_shape.is_stepwise
+                    if volume_shape.fail_reasons:
+                        notes["volume_shape_fail_reasons"] = volume_shape.fail_reasons
+                    reasons.append(
+                        "Step5成交量形态台阶式放量: "
+                        f"{step5_pass} (K={volume_shape.k_star}, gain={volume_shape.gain:.2f}, "
+                        f"ratio={volume_shape.recent_vs_early_ratio:.2f})"
+                    )
 
-            # Step6: 均线多头排列 + K线在均线之上
-            close_series = history["close"]
-            ma_snapshot = build_ma_snapshot(close_series, self.config.ma_periods)
-            ma_slope = {
-                period: slope(close_series.rolling(window=period).mean())
-                for period in self.config.ma_periods
-            }
-            bullish_alignment = is_bullish_alignment(ma_snapshot)
-            past_snapshot = build_ma_snapshot(
-                close_series.iloc[:-1], self.config.ma_periods
-            )
-            ma_diverging = is_diverging(ma_snapshot, past_snapshot)
-            close_above_ma = close_series.iloc[-1] > max(
-                ma_snapshot[period] for period in [5, 10, 20]
-            )
-            slope_positive = all(val > 0 for val in ma_slope.values())
-            step6_pass = bullish_alignment and ma_diverging and close_above_ma and slope_positive
-            reasons.append(
-                "Step6均线多头排列/上升发散/K线在均线上方: "
-                f"{step6_pass} (排列={bullish_alignment},发散={ma_diverging},"
-                f"K线={close_above_ma},斜率={slope_positive})"
-            )
+                # Step6: 均线多头排列 + K线在均线之上
+                close_series = history["close"]
+                ma_snapshot = build_ma_snapshot(close_series, self.config.ma_periods)
+                ma_slope = {
+                    period: slope(close_series.rolling(window=period).mean())
+                    for period in self.config.ma_slope_periods
+                }
+                bullish_alignment = is_bullish_alignment(ma_snapshot)
+                past_snapshot = build_ma_snapshot(
+                    close_series.iloc[:-1], self.config.ma_periods
+                )
+                ma_diverging = is_diverging(ma_snapshot, past_snapshot)
+                close_above_ma = close_series.iloc[-1] > max(
+                    ma_snapshot[period] for period in [5, 10, 20]
+                )
+                positive_count = sum(1 for val in ma_slope.values() if val > 0)
+                slope_positive = (
+                    positive_count / len(ma_slope) >= self.config.ma_slope_required_ratio
+                    if ma_slope
+                    else False
+                )
+                step6_pass = bullish_alignment and ma_diverging and close_above_ma and slope_positive
+                reasons.append(
+                    "Step6均线多头排列/上升发散/K线在均线上方: "
+                    f"{step6_pass} (排列={bullish_alignment},发散={ma_diverging},"
+                    f"K线={close_above_ma},斜率={slope_positive}:{positive_count}/{len(ma_slope)})"
+                )
 
         if step1_pass and step2_pass and step3_pass and step4_pass and step5_pass and step6_pass:
             # Step7: 分时图强势 + 跑赢大盘验证
@@ -180,7 +396,10 @@ class Tail30Strategy:
                 index_intraday = self._retry_call(
                     self.data_source.get_index_intraday, trade_date, "000001.SH"
                 )
-                intraday_result = intraday_strength(intraday, index_intraday)
+                if intraday.empty or index_intraday.empty:
+                    notes["intraday_empty"] = True
+                else:
+                    intraday_result = intraday_strength(intraday, index_intraday)
             except Exception as exc:
                 notes["intraday_error"] = str(exc)
                 intraday_result = None
